@@ -1,127 +1,124 @@
-import runpod
+import os
+import io
+import base64
 import torch
 from diffusers import ZImagePipeline
-import base64
-import io
-import os
-from datetime import datetime
-from supabase import create_client, Client
+from PIL import Image
+import runpod
 
-# Load model globally using ZImagePipeline
+# ------------------------------------------------------------------
+# Load model once at worker startup
+# ------------------------------------------------------------------
+MODEL_ID = os.environ.get("MODEL_ID", "Tongyi-MAI/Z-Image-Turbo")
+
 print("Loading Z-Image-Turbo model...")
 pipe = ZImagePipeline.from_pretrained(
-    "Tongyi-MAI/Z-Image-Turbo", 
+    MODEL_ID,
     torch_dtype=torch.bfloat16,
-    use_safetensors=True
+    use_safetensors=True,
+    low_cpu_mem_usage=False,
 ).to("cuda")
 print("Model loaded successfully.")
 
-# Initialize Supabase client
-SUPABASE_URL = os.environ.get("SUPABASE_URL")
-SUPABASE_KEY = os.environ.get("SUPABASE_SERVICE_KEY")  # Use service role key for storage access
 
-supabase: Client = None
-if SUPABASE_URL and SUPABASE_KEY:
-    supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
-    print("Supabase client initialized.")
-else:
-    print("WARNING: Supabase credentials not found. Images will only return as base64.")
+def encode_image(image: Image.Image) -> str:
+    """Convert a PIL image to a base64 PNG data URI."""
+    buffered = io.BytesIO()
+    image.save(buffered, format="PNG")
+    return "data:image/png;base64," + base64.b64encode(buffered.getvalue()).decode("utf-8")
+
+
+def validate_resolution(width: int, height: int) -> tuple[int, int]:
+    """Clamp and round resolution to valid VAE dimensions."""
+    width = (int(width) // 16) * 16
+    height = (int(height) // 16) * 16
+    width = max(512, min(2048, width))
+    height = max(512, min(2048, height))
+    return width, height
+
 
 def handler(job):
-    """
-    Handler function for RunPod serverless inference.
-    """
-    job_input = job['input']
-    job_id = job.get('id', 'unknown')
-    
-    # Security: Check for API Key
+    job_input = job.get("input", {})
+
+    # ------------------------------------------------------------------
+    # API key check (optional, set API_KEY env var to enable)
+    # ------------------------------------------------------------------
     expected_api_key = os.environ.get("API_KEY")
     if expected_api_key:
         input_api_key = job_input.get("api_key")
         if input_api_key != expected_api_key:
             return {"error": "Unauthorized: Invalid or missing 'api_key'"}
 
-    # Validate input
-    if 'prompt' not in job_input:
-        return {"error": "Missing 'prompt' in input"}
-        
-    prompt = job_input['prompt']
-    user_id = job_input.get('user_id')  # Optional: track which user generated this
-    
-    # Z-Image-Turbo optimal parameters
-    num_inference_steps = job_input.get('num_inference_steps', 8)
-    guidance_scale = job_input.get('guidance_scale', 0.0)
-    
-    # Run inference
-    print(f"Generating image for prompt: {prompt}")
-    with torch.inference_mode():
-        image = pipe(
-            prompt=prompt, 
-            num_inference_steps=num_inference_steps, 
-            guidance_scale=guidance_scale
-        ).images[0]
-    
-    # Convert to bytes
-    buffered = io.BytesIO()
-    image.save(buffered, format="PNG")
-    image_bytes = buffered.getvalue()
-    
-    # If Supabase is configured, upload the image
-    if supabase:
-        try:
-            # Generate unique filename
-            timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
-            filename = f"{timestamp}_{job_id[:8]}.png"
-            storage_path = f"images/{filename}"
-            
-            # Upload to Supabase Storage
-            print(f"Uploading to Supabase: {storage_path}")
-            supabase.storage.from_("generated-images").upload(
-                path=storage_path,
-                file=image_bytes,
-                file_options={"content-type": "image/png"}
-            )
-            
-            # Get public URL
-            public_url = supabase.storage.from_("generated-images").get_public_url(storage_path)
-            
-            # Save metadata to database
-            supabase.table("generated_images").insert({
-                "prompt": prompt,
-                "image_url": public_url,
-                "storage_path": storage_path,
-                "num_inference_steps": num_inference_steps,
-                "guidance_scale": guidance_scale,
-                "user_id": user_id,
-                "job_id": job_id
-            }).execute()
-            
-            print(f"Image saved successfully: {public_url}")
-            
-            return {
-                "success": True,
-                "image_url": public_url,
-                "storage_path": storage_path,
-                "prompt": prompt
-            }
-            
-        except Exception as e:
-            print(f"Error uploading to Supabase: {str(e)}")
-            # Fallback to base64 if upload fails
-            img_str = base64.b64encode(image_bytes).decode('utf-8')
-            return {
-                "success": False,
-                "error": f"Supabase upload failed: {str(e)}",
-                "image_base64": img_str,
-                "format": "png"
-            }
+    # ------------------------------------------------------------------
+    # Parse prompts
+    # ------------------------------------------------------------------
+    prompts_raw = job_input.get("prompt", "")
+    if isinstance(prompts_raw, str):
+        prompts = [prompts_raw]
+    elif isinstance(prompts_raw, list):
+        prompts = prompts_raw
     else:
-        # Fallback: return base64 if Supabase not configured
-        img_str = base64.b64encode(image_bytes).decode('utf-8')
-        return {
-            "image": img_str,
-            "format": "png",
-            "note": "Supabase not configured, returning base64"
-        }
+        return {"error": "prompt must be a string or list of strings"}
+
+    if not prompts or any(not isinstance(p, str) or not p.strip() for p in prompts):
+        return {"error": "all prompts must be non-empty strings"}
+
+    # ------------------------------------------------------------------
+    # Parse resolutions (defaults to 1024x1024)
+    # ------------------------------------------------------------------
+    resolutions = job_input.get("resolutions", [{"width": 1024, "height": 1024}])
+    if not isinstance(resolutions, list) or not resolutions:
+        return {"error": "resolutions must be a non-empty list"}
+
+    # ------------------------------------------------------------------
+    # Turbo parameters
+    # ------------------------------------------------------------------
+    num_inference_steps = int(job_input.get("num_inference_steps", 9))
+    guidance_scale = float(job_input.get("guidance_scale", 0.0))
+    num_images_per_prompt = int(job_input.get("num_images_per_prompt", 1))
+
+    seed = job_input.get("seed")
+    generator = None
+    if seed is not None:
+        generator = torch.Generator(device="cuda").manual_seed(int(seed))
+
+    # ------------------------------------------------------------------
+    # Generate images for each resolution
+    # ------------------------------------------------------------------
+    results = []
+
+    for res in resolutions:
+        width, height = validate_resolution(res.get("width", 1024), res.get("height", 1024))
+
+        with torch.inference_mode():
+            output = pipe(
+                prompt=prompts,
+                height=height,
+                width=width,
+                num_inference_steps=num_inference_steps,
+                guidance_scale=guidance_scale,
+                num_images_per_prompt=num_images_per_prompt,
+                generator=generator,
+            )
+
+        images_b64 = [encode_image(img) for img in output.images]
+
+        results.append({
+            "resolution": {"width": width, "height": height},
+            "images": images_b64,
+        })
+
+    return {
+        "success": True,
+        "results": results,
+        "metadata": {
+            "prompts": prompts,
+            "num_inference_steps": num_inference_steps,
+            "guidance_scale": guidance_scale,
+            "num_images_per_prompt": num_images_per_prompt,
+            "seed": seed,
+        },
+    }
+
 
 runpod.serverless.start({"handler": handler})
