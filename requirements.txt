@@ -1,7 +1,6 @@
+torch>=2.5
+diffusers>=0.33.0
+transformers
+accelerate
+Pillow
 runpod
-diffusers==0.27.2
-transformers==4.40.0
-accelerate==0.29.3
-huggingface_hub<0.25.0
-protobuf
-sentencepiece
