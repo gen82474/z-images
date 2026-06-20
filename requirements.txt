@@ -4,3 +4,4 @@ transformers
 accelerate
 Pillow
 runpod
+huggingface-hub
